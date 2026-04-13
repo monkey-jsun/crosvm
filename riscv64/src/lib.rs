@@ -42,6 +42,7 @@ use hypervisor::CoreRegister;
 use hypervisor::CpuConfigRiscv64;
 use hypervisor::Hypervisor;
 use hypervisor::ProtectionType;
+use hypervisor::ConfigRegister;
 use hypervisor::TimerRegister;
 use hypervisor::VcpuInitRiscv64;
 use hypervisor::VcpuRegister;
@@ -124,6 +125,8 @@ pub enum Error {
     FinalizeDevices(base::Error),
     #[error("failed to finalize IRQ chip: {0}")]
     FinalizeIrqChip(base::Error),
+    #[error("Failed to get ISA config from KVM: {0}")]
+    GetIsa(base::Error),
     #[error("failed to get serial cmdline: {0}")]
     GetSerialCmdline(GetSerialCmdlineError),
     #[error("Failed to get the timer base frequency: {0}")]
@@ -405,6 +408,27 @@ impl arch::LinuxArch for Riscv64 {
             .try_into()
             .map_err(|_| Error::TimebaseTooLarge)?;
 
+        // Query ISA base extensions from KVM and build the ISA string.
+        // The misa value encodes single-letter extensions in bits 0-25 (A-Z).
+        let misa: u64 = vcpus[0]
+            .get_one_reg(VcpuRegister::Config(ConfigRegister::Isa))
+            .map_err(Error::GetIsa)?;
+        let isa_string = {
+            let mut s = String::from("rv64");
+            // Extensions must appear in canonical order per the RISC-V ISA spec:
+            // base (i/e), then m, a, f, d, q, c, then remaining alphabetically.
+            const CANONICAL_ORDER: &[u8] = b"iemafdqcbghjklnoprstuvwxyz";
+            for &c in CANONICAL_ORDER {
+                let bit = (c - b'a') as u64;
+                if misa & (1 << bit) != 0 {
+                    s.push(c as char);
+                }
+            }
+            // Append multi-letter extensions that crosvm configures (AIA).
+            s.push_str("_smaia_ssaia");
+            s
+        };
+
         fdt::create_fdt(
             RISCV64_FDT_MAX_SIZE as usize,
             &mem,
@@ -421,6 +445,7 @@ impl arch::LinuxArch for Riscv64 {
                 .map_err(Error::Cmdline)?,
             initrd,
             timebase_freq,
+            &isa_string,
             device_tree_overlays,
         )
         .map_err(Error::CreateFdt)?;
