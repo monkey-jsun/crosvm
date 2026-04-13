@@ -70,7 +70,7 @@ mod fdt;
 
 // We place the kernel at offset 8MB
 const RISCV64_KERNEL_OFFSET: u64 = 0x20_0000;
-const RISCV64_INITRD_ALIGN: u64 = 8;
+const RISCV64_INITRD_ALIGN: u64 = 0x20_0000; // 2MB, clear kernel section-mapped region
 const RISCV64_FDT_ALIGN: u64 = 0x40_0000;
 
 // Maximum Linux riscv kernel command line size (arch/riscv/include/uapi/asm/setup.h).
@@ -346,7 +346,14 @@ impl arch::LinuxArch for Riscv64 {
             VmImage::Kernel(ref mut kernel_image) => {
                 let kernel_size = arch::load_image(&mem, kernel_image, get_kernel_addr(), u64::MAX)
                     .map_err(Error::KernelLoadFailure)?;
-                let kernel_end = get_kernel_addr().offset() + kernel_size as u64;
+                // The RISC-V Image header stores image_size at offset 16, which
+                // includes BSS that extends beyond the file.  The kernel zeros BSS
+                // early in boot, so FDT/initrd must be placed after image_size.
+                let image_size = mem
+                    .read_obj_from_addr::<u64>(GuestAddress(get_kernel_addr().offset() + 16))
+                    .unwrap_or(kernel_size as u64);
+                let kernel_end =
+                    get_kernel_addr().offset() + std::cmp::max(kernel_size as u64, image_size);
                 initrd = match components.initrd_image {
                     Some(initrd_file) => {
                         let mut initrd_file = initrd_file;
