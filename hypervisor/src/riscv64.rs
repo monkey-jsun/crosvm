@@ -85,6 +85,7 @@ impl CpuConfigRiscv64 {
 #[derive(Copy, Clone)]
 pub enum ConfigRegister {
     Isa = 0,
+    SatpMode = 6,
 }
 
 /// Timer registers exposed by kvm.

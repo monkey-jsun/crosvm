@@ -127,6 +127,8 @@ pub enum Error {
     FinalizeIrqChip(base::Error),
     #[error("Failed to get ISA config from KVM: {0}")]
     GetIsa(base::Error),
+    #[error("Failed to get SATP mode from KVM: {0}")]
+    GetSatpMode(base::Error),
     #[error("failed to get serial cmdline: {0}")]
     GetSerialCmdline(GetSerialCmdlineError),
     #[error("Failed to get the timer base frequency: {0}")]
@@ -157,6 +159,8 @@ pub enum Error {
     TimebaseTooLarge,
     #[error("this function isn't supported")]
     Unsupported,
+    #[error("Unsupported SATP mode: {0}")]
+    UnsupportedSatpMode(u64),
     #[error("failed to initialize VCPU: {0}")]
     VcpuInit(base::Error),
 }
@@ -436,6 +440,17 @@ impl arch::LinuxArch for Riscv64 {
             s
         };
 
+        // Query SATP mode from KVM to determine the MMU type for the FDT.
+        let satp_mode: u64 = vcpus[0]
+            .get_one_reg(VcpuRegister::Config(ConfigRegister::SatpMode))
+            .map_err(Error::GetSatpMode)?;
+        let mmu_type = match satp_mode {
+            8 => "riscv,sv39",
+            9 => "riscv,sv48",
+            10 => "riscv,sv57",
+            _ => return Err(Error::UnsupportedSatpMode(satp_mode)),
+        };
+
         fdt::create_fdt(
             RISCV64_FDT_MAX_SIZE as usize,
             &mem,
@@ -453,6 +468,7 @@ impl arch::LinuxArch for Riscv64 {
             initrd,
             timebase_freq,
             &isa_string,
+            mmu_type,
             device_tree_overlays,
         )
         .map_err(Error::CreateFdt)?;
