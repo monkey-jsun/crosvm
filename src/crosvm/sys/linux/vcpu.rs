@@ -463,11 +463,11 @@ fn vcpu_loop(
                     thread::sleep(Duration::from_nanos(delay_ns));
                 }
                 Ok(VcpuExit::Sbi {
-                    extension_id: _,
-                    function_id: _,
-                    args: _,
+                    extension_id,
+                    function_id,
+                    args,
                 }) => {
-                    unimplemented!("Sbi exits not yet supported");
+                    error!("SBI exit: ext_id={:#x} func_id={:#x} args={:?}", extension_id, function_id, args);
                 }
                 Ok(VcpuExit::RiscvCsr {
                     csr_num,
