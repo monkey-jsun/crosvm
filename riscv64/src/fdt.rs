@@ -4,12 +4,14 @@
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use arch::apply_device_tree_overlays;
 use arch::fdt::create_memory_node;
 use arch::DtbOverlay;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use arch::PlatformBusResources;
+use arch::serial::SerialDeviceInfo;
 use cros_fdt::Error;
 use cros_fdt::Fdt;
 use cros_fdt::Result;
@@ -21,6 +23,9 @@ use devices::PciAddress;
 use devices::PciInterruptPin;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+
+// Serial clock frequency for the ns16550a UART.
+const RISCV64_SERIAL_SPEED: u32 = 1843200;
 
 // This is the start of DRAM in the physical address space.
 use crate::RISCV64_PHYS_MEM_START;
@@ -65,14 +70,35 @@ fn create_cpu_nodes(
     Ok(())
 }
 
+fn create_serial_node(fdt: &mut Fdt, addr: u64, size: u64, irq: u32) -> Result<()> {
+    let serial_node = fdt.root_mut().subnode_mut(&format!("U6_16550A@{addr:x}"))?;
+    serial_node.set_prop("compatible", "ns16550a")?;
+    serial_node.set_prop("reg", &[addr, size])?;
+    serial_node.set_prop("clock-frequency", RISCV64_SERIAL_SPEED)?;
+    serial_node.set_prop("interrupt-parent", PHANDLE_AIA_APLIC)?;
+    serial_node.set_prop("interrupts", irq)?;
+    Ok(())
+}
+
+fn create_serial_nodes(fdt: &mut Fdt, serial_devices: &[SerialDeviceInfo]) -> Result<()> {
+    for dev in serial_devices {
+        create_serial_node(fdt, dev.address, dev.size, dev.irq)?;
+    }
+    Ok(())
+}
+
 fn create_chosen_node(
     fdt: &mut Fdt,
     cmdline: &str,
     initrd: Option<(GuestAddress, u32)>,
+    stdout_path: Option<&str>,
 ) -> Result<()> {
     let chosen_node = fdt.root_mut().subnode_mut("chosen")?;
     chosen_node.set_prop("linux,pci-probe-only", 1u32)?;
     chosen_node.set_prop("bootargs", cmdline)?;
+    if let Some(stdout_path) = stdout_path {
+        chosen_node.set_prop("stdout-path", stdout_path)?;
+    }
 
     let kaslr_seed: u64 = rand::random();
     chosen_node.set_prop("kaslr-seed", kaslr_seed)?;
@@ -287,6 +313,8 @@ pub fn create_fdt(
     timebase_frequency: u32,
     isa_string: &str,
     mmu_type: &str,
+    serial_devices: &[SerialDeviceInfo],
+    dump_device_tree_blob: Option<PathBuf>,
     device_tree_overlays: Vec<DtbOverlay>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
@@ -296,10 +324,14 @@ pub fn create_fdt(
     root_node.set_prop("compatible", "linux,dummy-virt")?;
     root_node.set_prop("#address-cells", 0x2u32)?;
     root_node.set_prop("#size-cells", 0x2u32)?;
-    create_chosen_node(&mut fdt, cmdline, initrd)?;
+    let stdout_path = serial_devices
+        .first()
+        .map(|first_serial| format!("/U6_16550A@{:x}", first_serial.address));
+    create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref())?;
     create_memory_node(&mut fdt, guest_mem)?;
     create_cpu_nodes(&mut fdt, num_vcpus, timebase_frequency, isa_string, mmu_type)?;
     create_aia_node(&mut fdt, num_vcpus as usize, aia_num_ids, aia_num_sources)?;
+    create_serial_nodes(&mut fdt, serial_devices)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges)?;
 
     // Done writing base FDT, now apply DT overlays
@@ -315,6 +347,11 @@ pub fn create_fdt(
     let fdt_final = fdt.finish()?;
     if fdt_final.len() > fdt_max_size {
         return Err(Error::TotalSizeTooLarge);
+    }
+
+    if let Some(file_path) = dump_device_tree_blob {
+        std::fs::write(&file_path, &fdt_final)
+            .map_err(|_| Error::FdtGuestMemoryWriteError)?;
     }
 
     let fdt_address = GuestAddress(RISCV64_PHYS_MEM_START + fdt_load_offset);

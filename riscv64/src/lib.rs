@@ -228,7 +228,7 @@ impl arch::LinuxArch for Riscv64 {
         devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>,
         irq_chip: &mut dyn IrqChipRiscv64,
         vcpu_ids: &mut Vec<usize>,
-        _dump_device_tree_blob: Option<PathBuf>,
+        dump_device_tree_blob: Option<PathBuf>,
         _debugcon_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
         _guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
@@ -476,6 +476,8 @@ impl arch::LinuxArch for Riscv64 {
             timebase_freq,
             &isa_string,
             mmu_type,
+            &serial_devices,
+            dump_device_tree_blob,
             device_tree_overlays,
         )
         .map_err(Error::CreateFdt)?;
