@@ -86,7 +86,7 @@ const RISCV64_PCI_CFG_SIZE: u64 = 0x100_0000;
 // This is the base address of MMIO devices.
 const RISCV64_MMIO_BASE: u64 = 0x0300_0000;
 // Size of the whole MMIO region.
-const RISCV64_MMIO_SIZE: u64 = 0x10_0000;
+const RISCV64_MMIO_SIZE: u64 = 0x200_0000; // 32MB, same as aarch64
 
 const RISCV64_FDT_MAX_SIZE: u64 = 0x1_0000;
 
