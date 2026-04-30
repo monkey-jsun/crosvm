@@ -4,6 +4,7 @@
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::path::PathBuf;
 
 use arch::apply_device_tree_overlays;
@@ -313,6 +314,7 @@ pub fn create_fdt(
     timebase_frequency: u32,
     isa_string: &str,
     mmu_type: &str,
+    android_fstab: Option<File>,
     serial_devices: &[SerialDeviceInfo],
     dump_device_tree_blob: Option<PathBuf>,
     device_tree_overlays: Vec<DtbOverlay>,
@@ -324,6 +326,9 @@ pub fn create_fdt(
     root_node.set_prop("compatible", "linux,dummy-virt")?;
     root_node.set_prop("#address-cells", 0x2u32)?;
     root_node.set_prop("#size-cells", 0x2u32)?;
+    if let Some(android_fstab) = android_fstab {
+        arch::android::create_android_fdt(&mut fdt, android_fstab)?;
+    }
     let stdout_path = serial_devices
         .first()
         .map(|first_serial| format!("/U6_16550A@{:x}", first_serial.address));
