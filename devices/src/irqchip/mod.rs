@@ -62,6 +62,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_arch = "riscv64")] {
         mod riscv64;
         pub use riscv64::*;
+        pub mod riscv64_plic;
         pub use self::kvm::aia_addr_imsic;
         pub use self::kvm::aia_aplic_addr;
         pub use self::kvm::aia_imsic_addr;

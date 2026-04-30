@@ -16,10 +16,6 @@ use arch::serial::SerialDeviceInfo;
 use cros_fdt::Error;
 use cros_fdt::Fdt;
 use cros_fdt::Result;
-use devices::irqchip::aia_aplic_addr;
-use devices::irqchip::aia_imsic_size;
-use devices::irqchip::AIA_APLIC_SIZE;
-use devices::irqchip::AIA_IMSIC_BASE;
 use devices::PciAddress;
 use devices::PciInterruptPin;
 use vm_memory::GuestAddress;
@@ -34,9 +30,13 @@ use crate::RISCV64_PHYS_MEM_START;
 // CPUs are assigned phandles starting with this number.
 const PHANDLE_CPU0: u32 = 0x100;
 
-const PHANDLE_AIA_APLIC: u32 = 2;
-const PHANDLE_AIA_IMSIC: u32 = 3;
+const PHANDLE_PLIC: u32 = 2;
 const PHANDLE_CPU_INTC_BASE: u32 = 4;
+
+// PLIC constants matching QEMU virt machine
+const PLIC_BASE: u64 = 0x0C00_0000;
+const PLIC_NUM_SOURCES: u32 = 95; // riscv,ndev value
+const PLIC_PCI_IRQ_BASE: u32 = 32; // PCI INTA=32, INTB=33, INTC=34, INTD=35
 
 fn create_cpu_nodes(
     fdt: &mut Fdt,
@@ -76,7 +76,7 @@ fn create_serial_node(fdt: &mut Fdt, addr: u64, size: u64, irq: u32) -> Result<(
     serial_node.set_prop("compatible", "ns16550a")?;
     serial_node.set_prop("reg", &[addr, size])?;
     serial_node.set_prop("clock-frequency", RISCV64_SERIAL_SPEED)?;
-    serial_node.set_prop("interrupt-parent", PHANDLE_AIA_APLIC)?;
+    serial_node.set_prop("interrupt-parent", PHANDLE_PLIC)?;
     serial_node.set_prop("interrupts", irq)?;
     Ok(())
 }
@@ -117,53 +117,35 @@ fn create_chosen_node(
     Ok(())
 }
 
-// num_ids: number of imsic ids from the aia subsystem
-// num_sources: number of aplic sources from the aia subsystem
-fn create_aia_node(
+/// Create a SiFive PLIC node in the FDT.
+/// This replaces the AIA (IMSIC+APLIC) nodes for guests with CONFIG_SIFIVE_PLIC=y
+/// but no IMSIC driver (kernel < 6.10).
+fn create_plic_node(
     fdt: &mut Fdt,
     num_vcpus: usize,
-    num_ids: usize,
-    num_sources: usize,
 ) -> Result<()> {
-    let name = format!("imsics@{AIA_IMSIC_BASE:#08x}");
-    let imsic_node = fdt.root_mut().subnode_mut(&name)?;
-    imsic_node.set_prop("compatible", "riscv,imsics")?;
+    // S-mode only: one context per hart
+    let num_contexts = num_vcpus;
+    let plic_size = 0x200000 + (num_contexts as u64) * 0x1000;
 
-    let regs = [
-        0u32,
-        AIA_IMSIC_BASE as u32,
-        0,
-        aia_imsic_size(num_vcpus) as u32,
-    ];
-    imsic_node.set_prop("reg", &regs)?;
-    imsic_node.set_prop("#interrupt-cells", 0u32)?;
-    imsic_node.set_prop("interrupt-controller", ())?;
-    imsic_node.set_prop("msi-controller", ())?;
-    imsic_node.set_prop("riscv,num-ids", num_ids as u32)?;
-    imsic_node.set_prop("phandle", PHANDLE_AIA_IMSIC)?;
+    let name = format!("plic@{PLIC_BASE:#x}");
+    let plic_node = fdt.root_mut().subnode_mut(&name)?;
+    plic_node.set_prop("compatible", vec!["sifive,plic-1.0.0".to_string(), "riscv,plic0".to_string()])?;
+    plic_node.set_prop("reg", &[0u32, PLIC_BASE as u32, 0u32, plic_size as u32])?;
+    plic_node.set_prop("#interrupt-cells", 1u32)?;
+    plic_node.set_prop("#address-cells", 0u32)?;
+    plic_node.set_prop("interrupt-controller", ())?;
+    plic_node.set_prop("riscv,ndev", PLIC_NUM_SOURCES)?;
+    plic_node.set_prop("phandle", PHANDLE_PLIC)?;
 
+    // interrupts-extended: one entry per hart, S-mode external IRQ (9)
     const S_MODE_EXT_IRQ: u32 = 9;
-    let mut cpu_intc_regs: Vec<u32> = Vec::with_capacity(num_vcpus * 2);
+    let mut intc_regs: Vec<u32> = Vec::with_capacity(num_vcpus * 2);
     for hart in 0..num_vcpus {
-        cpu_intc_regs.push(PHANDLE_CPU_INTC_BASE + hart as u32);
-        cpu_intc_regs.push(S_MODE_EXT_IRQ);
+        intc_regs.push(PHANDLE_CPU_INTC_BASE + hart as u32);
+        intc_regs.push(S_MODE_EXT_IRQ);
     }
-    imsic_node.set_prop("interrupts-extended", cpu_intc_regs)?;
-
-    /* Skip APLIC node if we have no interrupt sources */
-    if num_sources > 0 {
-        let name = format!("aplic@{:#08x}", aia_aplic_addr(num_vcpus));
-        let aplic_node = fdt.root_mut().subnode_mut(&name)?;
-        aplic_node.set_prop("compatible", "riscv,aplic")?;
-
-        let regs = [0u32, aia_aplic_addr(num_vcpus) as u32, 0, AIA_APLIC_SIZE];
-        aplic_node.set_prop("reg", &regs)?;
-        aplic_node.set_prop("#interrupt-cells", 2u32)?;
-        aplic_node.set_prop("interrupt-controller", ())?;
-        aplic_node.set_prop("riscv,num-sources", num_sources as u32)?;
-        aplic_node.set_prop("phandle", PHANDLE_AIA_APLIC)?;
-        aplic_node.set_prop("msi-parent", PHANDLE_AIA_IMSIC)?;
-    }
+    plic_node.set_prop("interrupts-extended", intc_regs)?;
 
     Ok(())
 }
@@ -239,30 +221,26 @@ fn create_pci_nodes(
     let bus_range = [0u32, 0u32]; // Only bus 0
     let reg = [cfg.base, cfg.size];
 
-    const IRQ_TYPE_LEVEL_HIGH: u32 = 0x00000004;
+    // PCI interrupt-map: one entry per device, using actual GSI numbers from crosvm.
+    // PLIC has #interrupt-cells=1, so each entry is 6 cells:
+    //   PCI_ADDR(3) + PIN(1) + PLIC_PHANDLE(1) + IRQ_NUM(1)
     let mut interrupts: Vec<u32> = Vec::new();
-
     for (address, irq_num, irq_pin) in pci_irqs.iter() {
         // PCI_DEVICE(3)
         interrupts.push(address.to_config_address(0, 8));
         interrupts.push(0);
         interrupts.push(0);
-
-        // INT#(1)
+        // INT# pin
         interrupts.push(irq_pin.to_mask() + 1);
-
-        // INTERRUPT INFO
-        interrupts.push(PHANDLE_AIA_APLIC);
+        // PLIC phandle + IRQ number (actual GSI from crosvm)
+        interrupts.push(PHANDLE_PLIC);
         interrupts.push(*irq_num);
-        interrupts.push(IRQ_TYPE_LEVEL_HIGH);
     }
 
     let mask: &[u32] = &[
-        // PCI_DEVICE(3)
-        0xf800, // bits 11..15 (device)
-        0, 0, // mask off other unit address cells
-        // INT#(1)
-        0x7, // allow INTA#-INTD# (1 | 2 | 3 | 4)
+        0xf800, // bits 11-15 (device number, all 32 slots)
+        0, 0,
+        0x7, // INT# pin (1-4)
     ];
 
     let pci_node = fdt.root_mut().subnode_mut("pci")?;
@@ -276,7 +254,6 @@ fn create_pci_nodes(
     pci_node.set_prop("#interrupt-cells", 1u32)?;
     pci_node.set_prop("interrupt-map", interrupts)?;
     pci_node.set_prop("interrupt-map-mask", mask)?;
-    pci_node.set_prop("msi-parent", PHANDLE_AIA_IMSIC)?;
     pci_node.set_prop("dma-coherent", ())?;
     Ok(())
 }
@@ -307,8 +284,6 @@ pub fn create_fdt(
     >,
     num_vcpus: u32,
     fdt_load_offset: u64,
-    aia_num_ids: usize,
-    aia_num_sources: usize,
     cmdline: &str,
     initrd: Option<(GuestAddress, u32)>,
     timebase_frequency: u32,
@@ -335,7 +310,7 @@ pub fn create_fdt(
     create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref())?;
     create_memory_node(&mut fdt, guest_mem)?;
     create_cpu_nodes(&mut fdt, num_vcpus, timebase_frequency, isa_string, mmu_type)?;
-    create_aia_node(&mut fdt, num_vcpus as usize, aia_num_ids, aia_num_sources)?;
+    create_plic_node(&mut fdt, num_vcpus as usize)?;
     create_serial_nodes(&mut fdt, serial_devices)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges)?;
 

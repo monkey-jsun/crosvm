@@ -2,12 +2,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::sync::Arc;
+use sync::Mutex;
+
 use base::Result;
+use hypervisor::kvm::KvmVcpu;
 use snapshot::AnySnapshot;
 
+use crate::irqchip::riscv64_plic::Plic;
 use crate::IrqChip;
 
 pub trait IrqChipRiscv64: IrqChip {
+    /// Returns the shared PLIC state for registering as a BusDevice.
+    fn get_plic(&self) -> Arc<Mutex<Plic>>;
+
+    /// Returns the shared vCPU list for PLIC interrupt injection.
+    fn get_vcpus(&self) -> Arc<Mutex<Vec<Option<KvmVcpu>>>>;
     /// Clones this trait as a `Box` version of itself.
     fn try_box_clone(&self) -> Result<Box<dyn IrqChipRiscv64>>;
 

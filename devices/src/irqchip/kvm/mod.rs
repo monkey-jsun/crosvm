@@ -59,13 +59,25 @@ impl IrqChip for KvmKernelIrqChip {
         irq_event: &IrqEdgeEvent,
         _source: IrqEventSource,
     ) -> Result<Option<IrqEventIndex>> {
-        self.vm.register_irqfd(irq, irq_event.get_trigger(), None)?;
-        Ok(None)
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            self.vm.register_irqfd(irq, irq_event.get_trigger(), None)?;
+            Ok(None)
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            // PLIC mode: return event index so main loop adds it to poll context.
+            // The IrqSetup::Event handler in linux.rs adds it to wait_ctx immediately.
+            self.register_irq_event(irq, irq_event.get_trigger().try_clone()?, None)
+        }
     }
 
     /// Unregister an event with edge-trigger semantic for a particular GSI.
     fn unregister_edge_irq_event(&mut self, irq: u32, irq_event: &IrqEdgeEvent) -> Result<()> {
-        self.vm.unregister_irqfd(irq, irq_event.get_trigger())
+        #[cfg(not(target_arch = "riscv64"))]
+        { self.vm.unregister_irqfd(irq, irq_event.get_trigger()) }
+        #[cfg(target_arch = "riscv64")]
+        { self.unregister_irq_event(irq) }
     }
 
     /// Register an event with level-trigger semantic that can trigger an interrupt
@@ -76,24 +88,40 @@ impl IrqChip for KvmKernelIrqChip {
         irq_event: &IrqLevelEvent,
         _source: IrqEventSource,
     ) -> Result<Option<IrqEventIndex>> {
-        self.vm
-            .register_irqfd(irq, irq_event.get_trigger(), Some(irq_event.get_resample()))?;
-        Ok(None)
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            self.vm
+                .register_irqfd(irq, irq_event.get_trigger(), Some(irq_event.get_resample()))?;
+            Ok(None)
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            self.register_irq_event(
+                irq,
+                irq_event.get_trigger().try_clone()?,
+                Some(irq_event.get_resample().try_clone()?),
+            )
+        }
     }
 
     /// Unregister an event with level-trigger semantic for a particular GSI.
     fn unregister_level_irq_event(&mut self, irq: u32, irq_event: &IrqLevelEvent) -> Result<()> {
-        self.vm.unregister_irqfd(irq, irq_event.get_trigger())
+        #[cfg(not(target_arch = "riscv64"))]
+        { self.vm.unregister_irqfd(irq, irq_event.get_trigger()) }
+        #[cfg(target_arch = "riscv64")]
+        { self.unregister_irq_event(irq) }
     }
 
     /// Route an IRQ line to an interrupt controller, or to a particular MSI vector.
     fn route_irq(&mut self, route: IrqRoute) -> Result<()> {
         let mut routes = self.routes.lock();
         routes.retain(|r| r.gsi != route.gsi);
-
         routes.push(route);
 
-        self.vm.set_gsi_routing(&routes)
+        #[cfg(not(target_arch = "riscv64"))]
+        { self.vm.set_gsi_routing(&routes) }
+        #[cfg(target_arch = "riscv64")]
+        { Ok(()) } // PLIC mode: no KVM GSI routing
     }
 
     /// Replace all irq routes with the supplied routes
@@ -101,32 +129,39 @@ impl IrqChip for KvmKernelIrqChip {
         let mut current_routes = self.routes.lock();
         *current_routes = routes.to_vec();
 
-        self.vm.set_gsi_routing(&current_routes)
+        #[cfg(not(target_arch = "riscv64"))]
+        { self.vm.set_gsi_routing(&current_routes) }
+        #[cfg(target_arch = "riscv64")]
+        { Ok(()) } // PLIC mode: no KVM GSI routing
     }
 
     /// Return a vector of all registered irq numbers and their associated events and event
-    /// indices. These should be used by the main thread to wait for irq events.
-    /// For the KvmKernelIrqChip, the kernel handles listening to irq events being triggered by
-    /// devices, so this function always returns an empty Vec.
+    /// indices.
     fn irq_event_tokens(&self) -> Result<Vec<(IrqEventIndex, IrqEventSource, Event)>> {
-        Ok(Vec::new())
+        #[cfg(not(target_arch = "riscv64"))]
+        { Ok(Vec::new()) }
+        #[cfg(target_arch = "riscv64")]
+        { self.plic_irq_event_tokens() }
     }
 
-    /// Either assert or deassert an IRQ line.  Sends to either an interrupt controller, or does
-    /// a send_msi if the irq is associated with an MSI.
-    /// For the KvmKernelIrqChip this simply calls the KVM_SET_IRQ_LINE ioctl.
+    /// Either assert or deassert an IRQ line.
     fn service_irq(&mut self, irq: u32, level: bool) -> Result<()> {
-        self.vm.set_irq_line(irq, level)
+        #[cfg(not(target_arch = "riscv64"))]
+        { self.vm.set_irq_line(irq, level) }
+        #[cfg(target_arch = "riscv64")]
+        { self.plic_service_irq(irq, level) }
     }
 
-    /// Service an IRQ event by asserting then deasserting an IRQ line. The associated Event
-    /// that triggered the irq event will be read from. If the irq is associated with a resample
-    /// Event, then the deassert will only happen after an EOI is broadcast for a vector
-    /// associated with the irq line.
-    /// This function should never be called on KvmKernelIrqChip.
-    fn service_irq_event(&mut self, _event_index: IrqEventIndex) -> Result<()> {
-        error!("service_irq_event should never be called for KvmKernelIrqChip");
-        Ok(())
+    /// Service an IRQ event by asserting then deasserting an IRQ line.
+    fn service_irq_event(&mut self, event_index: IrqEventIndex) -> Result<()> {
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = event_index;
+            error!("service_irq_event should never be called for KvmKernelIrqChip");
+            Ok(())
+        }
+        #[cfg(target_arch = "riscv64")]
+        { self.plic_service_irq_event(event_index) }
     }
 
     /// Broadcast an end of interrupt.
@@ -138,10 +173,11 @@ impl IrqChip for KvmKernelIrqChip {
     }
 
     /// Injects any pending interrupts for `vcpu`.
-    /// For KvmKernelIrqChip this is a no-op because KVM is responsible for injecting all
-    /// interrupts.
-    fn inject_interrupts(&self, _vcpu: &dyn Vcpu) -> Result<()> {
-        Ok(())
+    fn inject_interrupts(&self, vcpu: &dyn Vcpu) -> Result<()> {
+        #[cfg(not(target_arch = "riscv64"))]
+        { let _ = vcpu; Ok(()) }
+        #[cfg(target_arch = "riscv64")]
+        { self.plic_inject_interrupts(vcpu) }
     }
 
     /// Notifies the irq chip that the specified VCPU has executed a halt instruction.

@@ -107,19 +107,31 @@ impl Interrupt {
 
         match &self.inner.transport {
             Transport::Pci { pci } => {
-                // Don't need to set ISR for MSI-X interrupts
-                if let Some(msix_config) = &pci.msix_config {
-                    let mut msix_config = msix_config.lock();
-                    if msix_config.enabled() {
-                        if vector != VIRTIO_MSI_NO_VECTOR {
-                            msix_config.trigger(vector);
-                        }
-                        return;
-                    }
-                }
-
-                if self.inner.update_interrupt_status(interrupt_status_mask) {
+                // On riscv64 with PLIC: always set ISR and trigger INTx,
+                // because the guest uses PLIC (INTx) even though crosvm
+                // internally routes via MSI-X eventfds. The guest's
+                // vp_interrupt handler checks ISR to confirm the interrupt.
+                #[cfg(target_arch = "riscv64")]
+                {
+                    self.inner.update_interrupt_status(interrupt_status_mask);
                     pci.irq_evt_lvl.trigger().unwrap();
+                }
+                #[cfg(not(target_arch = "riscv64"))]
+                {
+                    // Don't need to set ISR for MSI-X interrupts
+                    if let Some(msix_config) = &pci.msix_config {
+                        let mut msix_config = msix_config.lock();
+                        if msix_config.enabled() {
+                            if vector != VIRTIO_MSI_NO_VECTOR {
+                                msix_config.trigger(vector);
+                            }
+                            return;
+                        }
+                    }
+
+                    if self.inner.update_interrupt_status(interrupt_status_mask) {
+                        pci.irq_evt_lvl.trigger().unwrap();
+                    }
                 }
             }
             Transport::Mmio { irq_evt_edge } => {

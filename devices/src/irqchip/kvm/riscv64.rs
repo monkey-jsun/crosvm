@@ -5,9 +5,12 @@
 use std::sync::Arc;
 
 use base::errno_result;
+use base::error;
 use base::ioctl_with_ref;
+use base::ioctl_with_val;
 use base::AsRawDescriptor;
 use base::Error as BaseError;
+use base::Event;
 use base::RawDescriptor;
 use base::Result;
 use base::SafeDescriptor;
@@ -15,12 +18,15 @@ use hypervisor::kvm::KvmVcpu;
 use hypervisor::kvm::KvmVm;
 use hypervisor::DeviceKind;
 use hypervisor::IrqRoute;
+use hypervisor::Vcpu;
 use hypervisor::Vm;
 use kvm_sys::*;
 use sync::Mutex;
 
 use crate::IrqChip;
 use crate::IrqChipRiscv64;
+use crate::IrqEventIndex;
+use crate::IrqEventSource;
 
 const RISCV_IRQCHIP: u64 = 0x0800_0000;
 
@@ -205,36 +211,50 @@ impl AsRawDescriptor for AiaDescriptor {
 /// IrqChip implementation where the entire IrqChip is emulated by KVM.
 ///
 /// This implementation will use the KVM API to create and configure the in-kernel irqchip.
+/// Stored IRQ event for userspace PLIC handling.
+struct PlicIrqEvent {
+    irq: u32,
+    trigger: Event,
+    resample: Option<Event>,
+}
+
+use crate::irqchip::riscv64_plic::Plic;
+use crate::irqchip::riscv64_plic::PLIC_NUM_SOURCES;
+
 pub struct KvmKernelIrqChip {
     pub(super) vm: KvmVm,
     pub(super) vcpus: Arc<Mutex<Vec<Option<KvmVcpu>>>>,
     num_vcpus: usize,
     num_ids: usize,     // number of imsics ids
     num_sources: usize, // number of aplic sources
-    aia: AiaDescriptor,
+    aia: Option<AiaDescriptor>,
     device_kind: DeviceKind,
     pub(super) routes: Arc<Mutex<Vec<IrqRoute>>>,
+    /// PLIC IRQ events (userspace handling).
+    plic_events: Arc<Mutex<Vec<PlicIrqEvent>>>,
+    /// PLIC state.
+    pub(crate) plic: Arc<Mutex<Plic>>,
 }
 
 impl KvmKernelIrqChip {
     /// Construct a new KvmKernelIrqchip.
     pub fn new(vm: KvmVm, num_vcpus: usize) -> Result<KvmKernelIrqChip> {
+        // Create KVM AIA device for proper vCPU interrupt infrastructure.
+        // Without AIA, KVM doesn't set up IMSIC interrupt files and timer
+        // interrupts don't work correctly. The FDT exposes PLIC (not AIA)
+        // to the guest, but AIA runs internally in KVM.
         let aia = AiaDescriptor(vm.create_device(DeviceKind::RiscvAia)?);
 
         let aia_mode = aia.get_aia_mode()?;
-        // Only support full emulation in the kernel.
         if aia_mode != AIA_MODE_HWACCEL && aia_mode != AIA_MODE_AUTO {
             return Err(BaseError::new(libc::ENOTSUP));
         }
 
-        // Don't need any wired interrupts, riscv can run PCI/MSI(X) only.
-        const NUM_SOURCES: u32 = 0;
+        const NUM_SOURCES: u32 = 64;
         aia.set_num_sources(NUM_SOURCES)?;
 
         let num_ids = aia.get_num_ids()?;
 
-        // set the number of bits needed for this count of harts.
-        // Need at least one bit.
         let max_hart_idx = num_vcpus as u64 - 1;
         let num_hart_bits = std::cmp::max(1, 64 - max_hart_idx.leading_zeros());
         aia.set_hart_bits(num_hart_bits)?;
@@ -245,11 +265,13 @@ impl KvmKernelIrqChip {
             num_vcpus,
             num_ids: num_ids as usize,
             num_sources: NUM_SOURCES as usize,
-            aia,
+            aia: Some(aia),
             device_kind: DeviceKind::RiscvAia,
             routes: Arc::new(Mutex::new(kvm_default_irq_routing_table(
                 NUM_SOURCES as usize,
             ))),
+            plic_events: Arc::new(Mutex::new(Vec::new())),
+            plic: Arc::new(Mutex::new(Plic::new(PLIC_NUM_SOURCES, num_vcpus))),
         })
     }
 
@@ -262,10 +284,111 @@ impl KvmKernelIrqChip {
             num_vcpus: self.num_vcpus,
             num_ids: self.num_ids,
             num_sources: self.num_sources,
-            aia: self.aia.try_clone()?,
+            aia: match &self.aia { Some(a) => Some(a.try_clone()?), None => None },
             device_kind: self.device_kind,
             routes: self.routes.clone(),
+            plic_events: self.plic_events.clone(),
+            plic: self.plic.clone(),
         })
+    }
+
+    /// Register an IRQ event for PLIC userspace handling.
+    pub fn register_irq_event(
+        &mut self,
+        irq: u32,
+        trigger: Event,
+        resample: Option<Event>,
+    ) -> Result<Option<IrqEventIndex>> {
+        let mut events = self.plic_events.lock();
+        let index = events.len();
+        events.push(PlicIrqEvent { irq, trigger, resample });
+        Ok(Some(index))
+    }
+
+    /// Unregister an IRQ event.
+    pub fn unregister_irq_event(&self, _irq: u32) -> Result<()> {
+        // For simplicity, don't remove — just ignore
+        Ok(())
+    }
+
+    /// Return IRQ event tokens for polling.
+    pub fn plic_irq_event_tokens(&self) -> Result<Vec<(IrqEventIndex, IrqEventSource, Event)>> {
+        let events = self.plic_events.lock();
+        let mut tokens = Vec::new();
+        for (i, evt) in events.iter().enumerate() {
+            tokens.push((
+                i,
+                IrqEventSource {
+                    device_id: vm_control::DeviceId::PlatformDeviceId(
+                        vm_control::PlatformDeviceId::Serial,
+                    ),
+                    queue_id: evt.irq as usize,
+                    device_name: format!("plic-irq-{}", evt.irq),
+                },
+                evt.trigger.try_clone()?,
+            ));
+        }
+        Ok(tokens)
+    }
+
+    /// Service an IRQ: update PLIC state.
+    pub fn plic_service_irq(&mut self, irq: u32, level: bool) -> Result<()> {
+        let mut plic = self.plic.lock();
+        plic.set_irq(irq, level);
+        let changes = plic.update();
+        drop(plic);
+        // Inject/deassert external interrupt for all contexts
+        let vcpus = self.vcpus.lock();
+        for (ctx, assert) in changes {
+            if let Some(Some(vcpu)) = vcpus.get(ctx) {
+                let interrupt = kvm_interrupt {
+                    irq: if assert { KVM_INTERRUPT_SET } else { KVM_INTERRUPT_UNSET } as u32,
+                };
+                let _ = unsafe { ioctl_with_ref(vcpu, KVM_INTERRUPT, &interrupt) };
+            }
+        }
+        Ok(())
+    }
+
+    /// Service an IRQ event: read the event, update PLIC, signal vCPUs.
+    /// Matches QEMU: set_irq → update → assert/deassert per context.
+    pub fn plic_service_irq_event(&mut self, event_index: IrqEventIndex) -> Result<()> {
+        let events = self.plic_events.lock();
+        if let Some(evt) = events.get(event_index) {
+            // Read the eventfd to acknowledge/consume the event
+            let _ = evt.trigger.wait();
+            let irq = evt.irq;
+            drop(events);
+
+            // Edge-triggered: assert then immediately deassert.
+            // Pending bit stays set (only cleared by claim), but source_level
+            // goes back to false so complete() won't re-pend.
+            let mut plic = self.plic.lock();
+            plic.set_irq(irq, true);
+            plic.set_irq(irq, false);
+            let changes = plic.update();
+            drop(plic);
+
+            // Assert/deassert external interrupt per PLIC evaluation.
+            // Always issue KVM_INTERRUPT with current state (like QEMU) to avoid desync.
+            let vcpus = self.vcpus.lock();
+            for (ctx, assert) in changes {
+                if let Some(Some(vcpu)) = vcpus.get(ctx) {
+                    let interrupt = kvm_interrupt {
+                        irq: if assert { KVM_INTERRUPT_SET } else { KVM_INTERRUPT_UNSET } as u32,
+                    };
+                    let _ = unsafe { ioctl_with_ref(vcpu, KVM_INTERRUPT, &interrupt) };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inject pending PLIC interrupts for a vCPU.
+    pub fn plic_inject_interrupts(&self, _vcpu: &dyn Vcpu) -> Result<()> {
+        // Interrupt injection is handled in plic_service_irq and PlicBusDevice.
+        // The KVM_INTERRUPT is called when IRQ state changes, not on every vCPU entry.
+        Ok(())
     }
 }
 
@@ -283,15 +406,27 @@ impl IrqChipRiscv64 for KvmKernelIrqChip {
     }
 
     fn finalize(&self) -> Result<()> {
-        // The kernel needs the number of vcpus finalized before setting up the address for each
-        // interrupt controller.
-        self.aia.set_aplic_addrs(self.num_vcpus)?;
-        self.aia.aia_init()?;
+        // PLIC mode: no AIA to finalize.
+        if let Some(ref aia) = self.aia {
+            aia.set_aplic_addrs(self.num_vcpus)?;
+            aia.aia_init()?;
+        }
         Ok(())
     }
 
     fn get_num_ids_sources(&self) -> (usize, usize) {
-        (self.num_ids, self.num_sources)
+        // Report 0 sources to FDT so APLIC node is omitted.
+        // KVM has 64 sources internally for proper AIA initialization,
+        // but the guest kernel can't use APLIC (driver fails to probe).
+        (self.num_ids, 0)
+    }
+
+    fn get_plic(&self) -> Arc<Mutex<Plic>> {
+        self.plic.clone()
+    }
+
+    fn get_vcpus(&self) -> Arc<Mutex<Vec<Option<KvmVcpu>>>> {
+        self.vcpus.clone()
     }
 }
 

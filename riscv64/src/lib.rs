@@ -96,6 +96,9 @@ fn get_kernel_addr() -> GuestAddress {
 
 const RISCV64_IRQ_BASE: u32 = 1;
 
+// Version tag for tracking crosvm PLIC builds. Bump on each change.
+const PLIC_BUILD_TAG: &str = "plic-v15-no-debug";
+
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
@@ -240,6 +243,8 @@ impl arch::LinuxArch for Riscv64 {
         V: VmRiscv64,
         Vcpu: VcpuRiscv64,
     {
+        base::info!("crosvm riscv64 build: {}", PLIC_BUILD_TAG);
+
         if components.hv_cfg.protection_type == ProtectionType::Protected {
             return Err(Error::ProtectedVmUnsupported);
         }
@@ -400,7 +405,49 @@ impl arch::LinuxArch for Riscv64 {
         irq_chip
             .finalize_devices(system_allocator, &io_bus, &mmio_bus)
             .map_err(Error::FinalizeDevices)?;
-        let (aia_num_ids, aia_num_sources) = irq_chip.get_num_ids_sources();
+
+        // Register PLIC BusDevice on MMIO bus for guest claim/complete access.
+        {
+            use devices::irqchip::riscv64_plic::{PlicBusDevice, PLIC_BASE};
+
+            let plic = irq_chip.get_plic();
+            let plic_aperture = plic.lock().aperture_size();
+
+            // Create vcpu_kick callback that injects/clears external interrupt
+            let vcpus_for_plic = irq_chip.get_vcpus();
+            // vcpu_kick: inject/clear external interrupt via KVM_INTERRUPT ioctl.
+            // Called by PlicBusDevice after claim (deassert) and complete (re-eval).
+            // KVM_INTERRUPT_SET = -1i32 as u32, KVM_INTERRUPT_UNSET = -2i32 as u32
+            let vcpu_kick: Arc<dyn Fn(usize, bool) + Send + Sync> =
+                Arc::new(move |ctx: usize, assert: bool| {
+                    let vcpus = vcpus_for_plic.lock();
+                    if let Some(Some(vcpu)) = vcpus.get(ctx) {
+                        // KVM_INTERRUPT ioctl number = 0x4004ae86
+                        // kvm_interrupt struct has one u32 field: irq
+                        let irq_val: u32 = if assert { (-1i32) as u32 } else { (-2i32) as u32 };
+                        let interrupt = [irq_val]; // kvm_interrupt { irq: u32 }
+                        unsafe {
+                            // KVM_INTERRUPT = _IOW(KVMIO, 0x86, kvm_interrupt)
+                            // KVMIO = 0xAE, _IOW = 0x40000000 | (4 << 16) | (0xAE << 8) | 0x86
+                            const KVM_INTERRUPT: u64 = 0x4004_ae86;
+                            libc::ioctl(
+                                base::AsRawDescriptor::as_raw_descriptor(vcpu),
+                                KVM_INTERRUPT,
+                                interrupt.as_ptr(),
+                            );
+                        }
+                    }
+                });
+
+            let plic_dev = PlicBusDevice::new(plic, vcpu_kick);
+            mmio_bus
+                .insert(
+                    Arc::new(Mutex::new(plic_dev)),
+                    PLIC_BASE,
+                    plic_aperture,
+                )
+                .expect("failed to register PLIC on MMIO bus");
+        }
 
         let pci_cfg = fdt::PciConfigRegion {
             base: RISCV64_PCI_CFG_BASE,
@@ -447,7 +494,9 @@ impl arch::LinuxArch for Riscv64 {
                     s.push(c as char);
                 }
             }
-            // Append multi-letter extensions that crosvm configures (AIA).
+            // Report CPU AIA capability (ssaia/smaia) even with PLIC —
+            // these describe CPU features, not which interrupt controller is used.
+            // QEMU does the same: reports ssaia in ISA even with PLIC FDT.
             s.push_str("_smaia_ssaia");
             s
         };
@@ -472,8 +521,6 @@ impl arch::LinuxArch for Riscv64 {
             dev_resources,
             components.vcpu_count as u32,
             fdt_offset,
-            aia_num_ids,
-            aia_num_sources,
             cmdline
                 .as_str_with_max_len(RISCV64_CMDLINE_MAX_SIZE - 1)
                 .map_err(Error::Cmdline)?,
