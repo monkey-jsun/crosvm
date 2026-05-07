@@ -227,8 +227,9 @@ impl KvmKernelIrqChip {
             return Err(BaseError::new(libc::ENOTSUP));
         }
 
-        // Don't need any wired interrupts, riscv can run PCI/MSI(X) only.
-        const NUM_SOURCES: u32 = 0;
+        // APLIC wired-IRQ sources (PCI INTx, serial, ...).  Upstream's 0 dropped
+        // the APLIC FDT node and broke of_irq_parse_pci.  64 ≈ 2x aarch64 NR_SPIS.
+        const NUM_SOURCES: u32 = 64;
         aia.set_num_sources(NUM_SOURCES)?;
 
         let num_ids = aia.get_num_ids()?;
