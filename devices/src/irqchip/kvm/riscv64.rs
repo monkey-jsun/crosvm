@@ -332,12 +332,13 @@ impl KvmKernelIrqChip {
     }
 
     /// Service an IRQ: update PLIC state.
+    /// Holds plic lock across KVM_INTERRUPT to prevent TOCTOU race where
+    /// a stale UNSET from a concurrent complete clobbers a newer SET.
     pub fn plic_service_irq(&mut self, irq: u32, level: bool) -> Result<()> {
         let mut plic = self.plic.lock();
         plic.set_irq(irq, level);
         let changes = plic.update();
-        drop(plic);
-        // Inject/deassert external interrupt for all contexts
+        // Keep plic locked while issuing KVM_INTERRUPT (lock order: plic → vcpus)
         let vcpus = self.vcpus.lock();
         for (ctx, assert) in changes {
             if let Some(Some(vcpu)) = vcpus.get(ctx) {
@@ -351,7 +352,8 @@ impl KvmKernelIrqChip {
     }
 
     /// Service an IRQ event: read the event, update PLIC, signal vCPUs.
-    /// Matches QEMU: set_irq → update → assert/deassert per context.
+    /// Holds plic lock across KVM_INTERRUPT to prevent TOCTOU race where
+    /// a stale UNSET from a concurrent complete clobbers a newer SET.
     pub fn plic_service_irq_event(&mut self, event_index: IrqEventIndex) -> Result<()> {
         let events = self.plic_events.lock();
         if let Some(evt) = events.get(event_index) {
@@ -367,10 +369,7 @@ impl KvmKernelIrqChip {
             plic.set_irq(irq, true);
             plic.set_irq(irq, false);
             let changes = plic.update();
-            drop(plic);
-
-            // Assert/deassert external interrupt per PLIC evaluation.
-            // Always issue KVM_INTERRUPT with current state (like QEMU) to avoid desync.
+            // Keep plic locked while issuing KVM_INTERRUPT (lock order: plic → vcpus)
             let vcpus = self.vcpus.lock();
             for (ctx, assert) in changes {
                 if let Some(Some(vcpu)) = vcpus.get(ctx) {

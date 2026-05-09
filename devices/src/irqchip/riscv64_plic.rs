@@ -283,6 +283,8 @@ impl BusDevice for PlicBusDevice {
         vm_control::DeviceId::PlatformDeviceId(vm_control::PlatformDeviceId::Serial)
     }
 
+    /// Read a PLIC register.  For claim reads, holds plic lock across
+    /// vcpu_kick to prevent TOCTOU race (lock order: plic → vcpus).
     fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
         if data.len() != 4 {
             return;
@@ -298,7 +300,7 @@ impl BusDevice for PlicBusDevice {
                 // Claim: atomically find best IRQ, clear pending, set claimed
                 let irq = plic.claim(context);
                 let changes = plic.update();
-                drop(plic);
+                // Keep plic locked while kicking vCPUs
                 for (ctx, assert) in changes {
                     (self.vcpu_kick)(ctx, assert);
                 }
@@ -313,6 +315,8 @@ impl BusDevice for PlicBusDevice {
         data.copy_from_slice(&value.to_le_bytes());
     }
 
+    /// Write a PLIC register.  Holds plic lock across vcpu_kick to
+    /// prevent TOCTOU race (lock order: plic → vcpus).
     fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
         if data.len() != 4 {
             return;
@@ -323,8 +327,7 @@ impl BusDevice for PlicBusDevice {
         let mut plic = self.plic.lock();
         plic.write(offset, value);
         let changes = plic.update();
-        drop(plic);
-
+        // Keep plic locked while kicking vCPUs
         for (ctx, assert) in changes {
             (self.vcpu_kick)(ctx, assert);
         }
