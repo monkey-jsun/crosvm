@@ -427,6 +427,20 @@ impl IrqChipRiscv64 for KvmKernelIrqChip {
     fn get_vcpus(&self) -> Arc<Mutex<Vec<Option<KvmVcpu>>>> {
         self.vcpus.clone()
     }
+
+    fn get_eoi_callback(&self) -> Arc<dyn Fn(u32) + Send + Sync> {
+        let plic_events = self.plic_events.clone();
+        Arc::new(move |irq: u32| {
+            let events = plic_events.lock();
+            for evt in events.iter() {
+                if evt.irq == irq {
+                    if let Some(ref resample) = evt.resample {
+                        let _ = resample.signal();
+                    }
+                }
+            }
+        })
+    }
 }
 
 /// Default RiscV routing table.

@@ -439,7 +439,8 @@ impl arch::LinuxArch for Riscv64 {
                     }
                 });
 
-            let plic_dev = PlicBusDevice::new(plic, vcpu_kick);
+            let eoi_callback = irq_chip.get_eoi_callback();
+            let plic_dev = PlicBusDevice::new(plic, vcpu_kick, eoi_callback);
             mmio_bus
                 .insert(
                     Arc::new(Mutex::new(plic_dev)),

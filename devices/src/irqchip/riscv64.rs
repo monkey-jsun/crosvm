@@ -18,6 +18,11 @@ pub trait IrqChipRiscv64: IrqChip {
 
     /// Returns the shared vCPU list for PLIC interrupt injection.
     fn get_vcpus(&self) -> Arc<Mutex<Vec<Option<KvmVcpu>>>>;
+
+    /// Returns a callback that signals resample events for the given IRQ.
+    /// Used by PlicBusDevice to notify devices on EOI so they can re-assert.
+    fn get_eoi_callback(&self) -> Arc<dyn Fn(u32) + Send + Sync>;
+
     /// Clones this trait as a `Box` version of itself.
     fn try_box_clone(&self) -> Result<Box<dyn IrqChipRiscv64>>;
 

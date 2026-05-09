@@ -261,14 +261,17 @@ pub struct PlicBusDevice {
     plic: Arc<Mutex<Plic>>,
     /// Callback to inject/clear external interrupt on a vCPU.
     vcpu_kick: Arc<dyn Fn(usize, bool) + Send + Sync>,
+    /// Callback to signal resample for an IRQ on EOI (so devices can re-assert).
+    eoi_callback: Arc<dyn Fn(u32) + Send + Sync>,
 }
 
 impl PlicBusDevice {
     pub fn new(
         plic: Arc<Mutex<Plic>>,
         vcpu_kick: Arc<dyn Fn(usize, bool) + Send + Sync>,
+        eoi_callback: Arc<dyn Fn(u32) + Send + Sync>,
     ) -> Self {
-        PlicBusDevice { plic, vcpu_kick }
+        PlicBusDevice { plic, vcpu_kick, eoi_callback }
     }
 }
 
@@ -317,6 +320,7 @@ impl BusDevice for PlicBusDevice {
 
     /// Write a PLIC register.  Holds plic lock across vcpu_kick to
     /// prevent TOCTOU race (lock order: plic → vcpus).
+    /// On EOI (complete), signals resample so devices can re-assert.
     fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
         if data.len() != 4 {
             return;
@@ -324,12 +328,29 @@ impl BusDevice for PlicBusDevice {
         let offset = info.offset;
         let value = u32::from_le_bytes(data.try_into().unwrap());
 
+        // Detect EOI (complete) writes to signal resample afterward
+        let mut eoi_irq: Option<u32> = None;
+        if offset >= CONTEXT_BASE {
+            let ctx_offset = offset - CONTEXT_BASE;
+            let reg = ctx_offset % CONTEXT_STRIDE;
+            if reg == CONTEXT_CLAIM && value != 0 {
+                eoi_irq = Some(value);
+            }
+        }
+
         let mut plic = self.plic.lock();
         plic.write(offset, value);
         let changes = plic.update();
         // Keep plic locked while kicking vCPUs
         for (ctx, assert) in changes {
             (self.vcpu_kick)(ctx, assert);
+        }
+        drop(plic);
+
+        // Signal resample AFTER releasing plic lock to avoid deadlock
+        // (resample thread may call trigger → service_irq_event → plic lock)
+        if let Some(irq) = eoi_irq {
+            (self.eoi_callback)(irq);
         }
     }
 }
