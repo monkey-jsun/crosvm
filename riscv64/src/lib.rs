@@ -68,6 +68,13 @@ use vm_memory::MemoryRegionOptions;
 
 mod fdt;
 
+// Bump on every rebuild we hand off for testing so the running binary can be
+// identified from logs. Format: "<area>-v<n>-<short-description>".
+// aia2- prefix marks the post-rewind line after we confirmed (2026-05-12)
+// that the v14/v15 freeze is a kernel-side bug independent of any crosvm
+// workaround.
+const BUILD_TAG: &str = "aia2-v1-vanilla-baseline";
+
 // We place the kernel at offset 8MB
 const RISCV64_KERNEL_OFFSET: u64 = 0x20_0000;
 const RISCV64_INITRD_ALIGN: u64 = 0x20_0000; // 2MB, clear kernel section-mapped region
@@ -240,6 +247,8 @@ impl arch::LinuxArch for Riscv64 {
         V: VmRiscv64,
         Vcpu: VcpuRiscv64,
     {
+        base::info!("crosvm riscv64 build: {}", BUILD_TAG);
+
         if components.hv_cfg.protection_type == ProtectionType::Protected {
             return Err(Error::ProtectedVmUnsupported);
         }
