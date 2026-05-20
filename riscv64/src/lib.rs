@@ -73,7 +73,7 @@ mod fdt;
 // aia2- prefix marks the post-rewind line after we confirmed (2026-05-12)
 // that the v14/v15 freeze is a kernel-side bug independent of any crosvm
 // workaround.
-const BUILD_TAG: &str = "aia2-v1-vanilla-baseline";
+const BUILD_TAG: &str = "aia2-v3-num-sources-cap";
 
 // We place the kernel at offset 8MB
 const RISCV64_KERNEL_OFFSET: u64 = 0x20_0000;
