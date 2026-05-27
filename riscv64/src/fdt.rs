@@ -239,13 +239,15 @@ fn create_pci_nodes(
     let bus_range = [0u32, 0u32]; // Only bus 0
     let reg = [cfg.base, cfg.size];
 
-    // EDGE_RISING (not LEVEL_HIGH) — RISC-V KVM AIA does not call
-    // kvm_notify_acked_irq from its IMSIC EOI path (unlike aarch64 GIC),
-    // so crosvm's level-IRQ resampler fd never fires and APLIC source
-    // stays asserted forever, generating 40K MSI/sec storms.  Edge mode
-    // makes each crosvm trigger one-shot, no deassertion needed.  Safe
-    // because cuttlefish has no shared INTx lines and MSI-X is primary.
-    const IRQ_TYPE_EDGE_RISING: u32 = 0x00000001;
+    // LEVEL_HIGH — the spec-correct type for PCI INTx. Restored from the
+    // EDGE_RISING workaround now that wired INTx delivers correctly on a
+    // stock APLIC: crosvm registers these lines as non-resampler irqfds
+    // (riscv64) and the host KVM irqfd slow path auto-pulses the line
+    // set_irq(1)->set_irq(0), so the APLIC source INPUT bit cycles instead
+    // of latching. The guest's level EOI retrigger (SETIPNUM) then finds
+    // INPUT=0 and does not re-pend, so there is no MSI storm. Requires the
+    // riscv kvm_arch_set_irq_inatomic IRQCHIP fix (K2) so the slow path runs.
+    const IRQ_TYPE_LEVEL_HIGH: u32 = 0x00000004;
     let mut interrupts: Vec<u32> = Vec::new();
 
     for (address, irq_num, irq_pin) in pci_irqs.iter() {
@@ -260,7 +262,7 @@ fn create_pci_nodes(
         // INTERRUPT INFO
         interrupts.push(PHANDLE_AIA_APLIC);
         interrupts.push(*irq_num);
-        interrupts.push(IRQ_TYPE_EDGE_RISING);
+        interrupts.push(IRQ_TYPE_LEVEL_HIGH);
     }
 
     let mask: &[u32] = &[
