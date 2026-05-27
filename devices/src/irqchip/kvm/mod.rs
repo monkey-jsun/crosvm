@@ -76,8 +76,18 @@ impl IrqChip for KvmKernelIrqChip {
         irq_event: &IrqLevelEvent,
         _source: IrqEventSource,
     ) -> Result<Option<IrqEventIndex>> {
+        // RISC-V AIA KVM has no resampler EOI notification (arch/riscv never calls
+        // kvm_notify_acked_irq), so a RESAMPLE irqfd never deasserts and the APLIC source's
+        // INPUT bit latches high -> interrupt storm (LEVEL) or dropped repeats (EDGE). Register
+        // as a non-resampler irqfd instead; KVM's irqfd_inject then auto-pulses the line 1->0
+        // per signal so INPUT cycles correctly. Other arches' irqchips do notify, so they keep
+        // the resampler.
+        #[cfg(target_arch = "riscv64")]
+        let resample = None;
+        #[cfg(not(target_arch = "riscv64"))]
+        let resample = Some(irq_event.get_resample());
         self.vm
-            .register_irqfd(irq, irq_event.get_trigger(), Some(irq_event.get_resample()))?;
+            .register_irqfd(irq, irq_event.get_trigger(), resample)?;
         Ok(None)
     }
 
