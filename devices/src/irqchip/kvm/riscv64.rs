@@ -57,6 +57,7 @@ const KVM_DEV_RISCV_AIA_CONFIG_HART_BITS: u64 = 5;
 pub const IMSIC_MAX_INT_IDS: u64 = 2047;
 
 // CONFIG_MODE values
+const AIA_MODE_EMUL: u32 = 0;
 const AIA_MODE_HWACCEL: u32 = 1;
 const AIA_MODE_AUTO: u32 = 2;
 
@@ -143,6 +144,31 @@ impl AiaDescriptor {
         Ok(())
     }
 
+    // aia5 step 2: force KVM into EMUL mode so MSIs land in software-emulated
+    // MRIF (swfile) instead of the K3 silicon vsfile.  This is the spec-§6.2
+    // hvip.VSEIP path that KVM already implements; we just opt into it
+    // explicitly instead of accepting the AUTO default that prefers vsfile.
+    // Diagnostic value: sidesteps K3 silicon vsfile entirely.  Per audit, the
+    // KVM swfile branch is fully wired (kvm_riscv_vcpu_aia_imsic_inject lines
+    // 1041-1045) and the spec §6.1 promise guarantees the guest sees an
+    // indistinguishable IMSIC.
+    fn set_aia_mode(&self, mode: u32) -> Result<()> {
+        let raw_mode = &mode as *const u32;
+        let kvm_attr = kvm_device_attr {
+            group: KVM_DEV_RISCV_AIA_GRP_CONFIG,
+            attr: KVM_DEV_RISCV_AIA_CONFIG_MODE,
+            addr: raw_mode as u64,
+            flags: 0,
+        };
+        // SAFETY: Safe because we allocated the struct that's being passed in,
+        // and raw_mode is pointing to a uniquely owned local, mutable variable.
+        let ret = unsafe { ioctl_with_ref(self, KVM_SET_DEVICE_ATTR, &kvm_attr) };
+        if ret != 0 {
+            return errno_result();
+        }
+        Ok(())
+    }
+
     fn set_hart_bits(&self, hart_bits: u32) -> Result<()> {
         let raw_hart_bits = &hart_bits as *const u32;
         let kvm_attr = kvm_device_attr {
@@ -221,9 +247,17 @@ impl KvmKernelIrqChip {
     pub fn new(vm: KvmVm, num_vcpus: usize) -> Result<KvmKernelIrqChip> {
         let aia = AiaDescriptor(vm.create_device(DeviceKind::RiscvAia)?);
 
+        // aia5 step 2: opt into EMUL mode before any further configuration.
+        // EMUL must be set before aia_init() (kernel rejects mode changes once
+        // irqchip is initialized).  This must come before set_num_sources etc.
+        aia.set_aia_mode(AIA_MODE_EMUL)?;
+
         let aia_mode = aia.get_aia_mode()?;
-        // Only support full emulation in the kernel.
-        if aia_mode != AIA_MODE_HWACCEL && aia_mode != AIA_MODE_AUTO {
+        // EMUL/HWACCEL/AUTO are all accepted; EMUL is what we just set.
+        if aia_mode != AIA_MODE_EMUL
+            && aia_mode != AIA_MODE_HWACCEL
+            && aia_mode != AIA_MODE_AUTO
+        {
             return Err(BaseError::new(libc::ENOTSUP));
         }
 
