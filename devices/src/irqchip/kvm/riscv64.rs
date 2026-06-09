@@ -227,12 +227,14 @@ impl KvmKernelIrqChip {
             return Err(BaseError::new(libc::ENOTSUP));
         }
 
-        // APLIC wired-IRQ sources (PCI INTx, serial, ...).  Upstream's 0 dropped
-        // the APLIC FDT node and broke of_irq_parse_pci.  64 ≈ 2x aarch64 NR_SPIS.
-        const NUM_SOURCES: u32 = 64;
-        aia.set_num_sources(NUM_SOURCES)?;
+        // APLIC wired-IRQ sources (PCI INTx, serial, ...). 64 ≈ 2x aarch64 NR_SPIS.
+        const NUM_SOURCES_DESIRED: u32 = 64;
 
+        // Kernel requires nr_sources <= nr_ids (aia_device.c aia_init), so cap
+        // against the actual per-vsfile id count reported by KVM.
         let num_ids = aia.get_num_ids()?;
+        let num_sources = std::cmp::min(NUM_SOURCES_DESIRED, num_ids);
+        aia.set_num_sources(num_sources)?;
 
         // set the number of bits needed for this count of harts.
         // Need at least one bit.
@@ -245,11 +247,11 @@ impl KvmKernelIrqChip {
             vcpus: Arc::new(Mutex::new((0..num_vcpus).map(|_| None).collect())),
             num_vcpus,
             num_ids: num_ids as usize,
-            num_sources: NUM_SOURCES as usize,
+            num_sources: num_sources as usize,
             aia,
             device_kind: DeviceKind::RiscvAia,
             routes: Arc::new(Mutex::new(kvm_default_irq_routing_table(
-                NUM_SOURCES as usize,
+                num_sources as usize,
             ))),
         })
     }
