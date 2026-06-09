@@ -144,6 +144,23 @@ impl AiaDescriptor {
         Ok(())
     }
 
+    fn set_num_ids(&self, num_ids: u32) -> Result<()> {
+        let raw_num_ids = &num_ids as *const u32;
+        let kvm_attr = kvm_device_attr {
+            group: KVM_DEV_RISCV_AIA_GRP_CONFIG,
+            attr: KVM_DEV_RISCV_AIA_CONFIG_IDS,
+            addr: raw_num_ids as u64,
+            flags: 0,
+        };
+        // SAFETY: Safe because we allocated the struct that's being passed in, and raw_num_ids is
+        // pointing to a uniquely owned local, mutable variable.
+        let ret = unsafe { ioctl_with_ref(self, KVM_SET_DEVICE_ATTR, &kvm_attr) };
+        if ret != 0 {
+            return errno_result();
+        }
+        Ok(())
+    }
+
     // aia5 step 2: force KVM into EMUL mode so MSIs land in software-emulated
     // MRIF (swfile) instead of the K3 silicon vsfile.  This is the spec-§6.2
     // hvip.VSEIP path that KVM already implements; we just opt into it
@@ -261,11 +278,25 @@ impl KvmKernelIrqChip {
             return Err(BaseError::new(libc::ENOTSUP));
         }
 
+        // aia5 step 4: raise IMSIC id budget for EMUL mode.
+        //
+        // K3 silicon's IMSIC vsfile holds 63 iids (kvm_riscv_aia_max_ids = 64
+        // on this host) — but in EMUL mode KVM uses an in-host SW-file (swfile),
+        // not the silicon vsfile, so that constraint doesn't physically apply.
+        // Upstream KVM still enforces it via aia_config; k3-test runs a host
+        // patch that relaxes the check when aia->mode == EMUL, after which the
+        // valid values are 63, 127, 255, 511, ..., up to (IMSIC_MAX_ID - 1).
+        //
+        // 511 gives ~8x the prior IRQ-vector budget so virtio_pci's MSI-X
+        // EACH/SHARED_SLOW/SHARED fallbacks find room (previously we lost the
+        // 11th-21st virtio_console to -ENOSPC).  Value must satisfy
+        // (n & 63) == 63 per KVM_DEV_RISCV_AIA_IDS_MIN.
+        const NUM_IDS_DESIRED: u32 = 511;
+        aia.set_num_ids(NUM_IDS_DESIRED)?;
+
         // APLIC wired-IRQ sources (PCI INTx, serial, ...).  Upstream's 0 dropped
         // the APLIC FDT node and broke of_irq_parse_pci.  64 ≈ 2x aarch64 NR_SPIS.
-        // Kernel requires nr_sources <= nr_ids (aia_device.c aia_init), so cap
-        // against the actual per-vsfile id count reported by KVM (silicon-limited
-        // to 63 on K3 X100).
+        // Kernel requires nr_sources <= nr_ids (aia_device.c aia_init).
         const NUM_SOURCES_DESIRED: u32 = 64;
 
         let num_ids = aia.get_num_ids()?;
