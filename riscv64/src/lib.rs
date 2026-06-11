@@ -98,6 +98,8 @@ const RISCV64_IRQ_BASE: u32 = 1;
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("bios could not be loaded: {0}")]
+    BiosLoadFailure(arch::LoadImageError),
     #[error("unable to clone an Event: {0}")]
     CloneEvent(base::Error),
     #[error("failed to clone IRQ chip: {0}")]
@@ -128,8 +130,6 @@ pub enum Error {
     GetSerialCmdline(GetSerialCmdlineError),
     #[error("Failed to get the timer base frequency: {0}")]
     GetTimebase(base::Error),
-    #[error("Image type not supported on riscv")]
-    ImageTypeUnsupported,
     #[error("initrd could not be loaded: {0}")]
     InitrdLoadFailure(arch::LoadImageError),
     #[error("kernel could not be loaded: {0}")]
@@ -329,8 +329,13 @@ impl arch::LinuxArch for Riscv64 {
         // image loading
         let initrd: Option<(GuestAddress, u32)>;
         let kernel_initrd_end = match components.vm_image {
-            VmImage::Bios(ref _bios) => {
-                return Err(Error::ImageTypeUnsupported);
+            VmImage::Bios(ref mut bios) => {
+                // Load BIOS (e.g. U-Boot) at the kernel address.  KVM provides
+                // the SBI layer, so the BIOS runs in S-mode just like a kernel.
+                let bios_size = arch::load_image(&mem, bios, get_kernel_addr(), u64::MAX)
+                    .map_err(Error::BiosLoadFailure)?;
+                initrd = None;
+                get_kernel_addr().offset() + bios_size as u64 - RISCV64_PHYS_MEM_START
             }
             VmImage::Kernel(ref mut kernel_image) => {
                 let kernel_size = arch::load_image(&mem, kernel_image, get_kernel_addr(), u64::MAX)
