@@ -469,6 +469,7 @@ impl arch::LinuxArch for Riscv64 {
             timebase_freq,
             &isa_string,
             mmu_type,
+            components.android_fstab,
             &serial_devices,
             dump_device_tree_blob,
             device_tree_overlays,
