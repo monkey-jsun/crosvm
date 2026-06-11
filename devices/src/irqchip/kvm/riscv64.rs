@@ -221,8 +221,9 @@ impl KvmKernelIrqChip {
             return Err(BaseError::new(libc::ENOTSUP));
         }
 
-        // Don't need any wired interrupts, riscv can run PCI/MSI(X) only.
-        const NUM_SOURCES: u32 = 0;
+        // APLIC wired-IRQ sources (PCI INTx, serial, etc.).  64 provides
+        // headroom comparable to aarch64's NR_SPIS budget.
+        const NUM_SOURCES: u32 = 64;
         aia.set_num_sources(NUM_SOURCES)?;
 
         let num_ids = aia.get_num_ids()?;
