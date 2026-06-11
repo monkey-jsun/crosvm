@@ -36,6 +36,7 @@ fn create_cpu_nodes(
     num_vcpus: u32,
     timebase_frequency: u32,
     isa_string: &str,
+    mmu_type: &str,
 ) -> Result<()> {
     let cpus_node = fdt.root_mut().subnode_mut("cpus")?;
     cpus_node.set_prop("#address-cells", 0x1u32)?;
@@ -47,7 +48,7 @@ fn create_cpu_nodes(
         let cpu_node = cpus_node.subnode_mut(&cpu_name)?;
         cpu_node.set_prop("device_type", "cpu")?;
         cpu_node.set_prop("compatible", "riscv")?;
-        cpu_node.set_prop("mmu-type", "sv48")?;
+        cpu_node.set_prop("mmu-type", mmu_type)?;
         cpu_node.set_prop("riscv,isa", isa_string)?;
         cpu_node.set_prop("status", "okay")?;
         cpu_node.set_prop("reg", vcpu_id)?;
@@ -282,6 +283,7 @@ pub fn create_fdt(
     initrd: Option<(GuestAddress, u32)>,
     timebase_frequency: u32,
     isa_string: &str,
+    mmu_type: &str,
     device_tree_overlays: Vec<DtbOverlay>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
@@ -293,7 +295,7 @@ pub fn create_fdt(
     root_node.set_prop("#size-cells", 0x2u32)?;
     create_chosen_node(&mut fdt, cmdline, initrd)?;
     create_memory_node(&mut fdt, guest_mem)?;
-    create_cpu_nodes(&mut fdt, num_vcpus, timebase_frequency, isa_string)?;
+    create_cpu_nodes(&mut fdt, num_vcpus, timebase_frequency, isa_string, mmu_type)?;
     create_aia_node(&mut fdt, num_vcpus as usize, aia_num_ids, aia_num_sources)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges)?;
 
