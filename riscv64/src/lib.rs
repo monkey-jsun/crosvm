@@ -38,11 +38,11 @@ use devices::PciRootCommand;
 use gdbstub::arch::Arch;
 #[cfg(feature = "gdb")]
 use gdbstub_arch::riscv::Riscv64 as GdbArch;
+use hypervisor::ConfigRegister;
 use hypervisor::CoreRegister;
 use hypervisor::CpuConfigRiscv64;
 use hypervisor::Hypervisor;
 use hypervisor::ProtectionType;
-use hypervisor::ConfigRegister;
 use hypervisor::TimerRegister;
 use hypervisor::VcpuInitRiscv64;
 use hypervisor::VcpuRegister;
@@ -67,6 +67,7 @@ use vm_memory::GuestMemory;
 use vm_memory::MemoryRegionOptions;
 
 mod fdt;
+mod isa;
 
 // We place the kernel at offset 8MB
 const RISCV64_KERNEL_OFFSET: u64 = 0x20_0000;
@@ -429,21 +430,74 @@ impl arch::LinuxArch for Riscv64 {
         let misa: u64 = vcpus[0]
             .get_one_reg(VcpuRegister::Config(ConfigRegister::Isa))
             .map_err(Error::GetIsa)?;
-        let isa_string = {
-            let mut s = String::from("rv64");
-            // Extensions must appear in canonical order per the RISC-V ISA spec:
-            // base (i/e), then m, a, f, d, q, c, then remaining alphabetically.
-            const CANONICAL_ORDER: &[u8] = b"iemafdqcbghjklnoprstuvwxyz";
-            for &c in CANONICAL_ORDER {
-                let bit = (c - b'a') as u64;
-                if misa & (1 << bit) != 0 {
-                    s.push(c as char);
-                }
+        // Advertise the guest as RVA23U64-compatible: each profile extension is emitted only
+        // if KVM confirms it is enabled on the vCPU.  See isa.rs for the policy.
+        let mut multi: Vec<&str> = Vec::new();
+        for ext in isa::RVA23U64 {
+            match vcpus[0].get_one_reg(VcpuRegister::IsaExt(ext.kvm_id)) {
+                Ok(1) => multi.push(ext.name),
+                Ok(_) => base::debug!("riscv64: {} known to KVM but disabled on vCPU", ext.name),
+                Err(e) => base::debug!(
+                    "riscv64: KVM has no ISA ext id {} ({}): {}",
+                    ext.kvm_id,
+                    ext.name,
+                    e
+                ),
             }
-            // Append multi-letter extensions that crosvm configures (AIA).
-            s.push_str("_smaia_ssaia");
-            s
-        };
+        }
+
+        // Cache-block extensions are only useful with their block size, and the guest kernel
+        // disables them if the size is missing.  Read each from KVM; drop the extension
+        // rather than advertise something the guest will reject.
+        let mut cbo_block_sizes = [0u32; 3];
+        for (i, (name, reg)) in [
+            (isa::ZICBOM, ConfigRegister::ZicbomBlockSize),
+            (isa::ZICBOZ, ConfigRegister::ZicbozBlockSize),
+            (isa::ZICBOP, ConfigRegister::ZicbopBlockSize),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !multi.contains(&name) {
+                continue;
+            }
+            let size = vcpus[0].get_one_reg(VcpuRegister::Config(reg)).unwrap_or(0);
+            if size == 0 || !size.is_power_of_two() || size > u32::MAX as u64 {
+                base::warn!(
+                    "riscv64: {} enabled but KVM reports block size {}; not advertising it",
+                    name,
+                    size
+                );
+                multi.retain(|n| *n != name);
+            } else {
+                cbo_block_sizes[i] = size as u32;
+            }
+        }
+
+        // AIA is always configured by crosvm (unchanged from before this change).
+        multi.push("smaia");
+        multi.push("ssaia");
+        isa::sort_canonical(&mut multi);
+
+        let isa_string = isa::legacy_isa_string(misa, &multi);
+        // The list form must include the single-letter extensions too.
+        let letters: Vec<String> = isa::misa_letters(misa)
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let isa_extensions: Vec<&str> = letters
+            .iter()
+            .map(String::as_str)
+            .chain(multi.iter().copied())
+            .collect();
+
+        base::info!(
+            "riscv64: guest ISA (RVA23U64 profile, KVM-verified): {} cbom={} cboz={} cbop={}",
+            isa_string,
+            cbo_block_sizes[0],
+            cbo_block_sizes[1],
+            cbo_block_sizes[2]
+        );
 
         // Query SATP mode from KVM to determine the MMU type for the FDT.
         let satp_mode: u64 = vcpus[0]
@@ -473,6 +527,8 @@ impl arch::LinuxArch for Riscv64 {
             initrd,
             timebase_freq,
             &isa_string,
+            &isa_extensions,
+            cbo_block_sizes,
             mmu_type,
             components.android_fstab,
             &serial_devices,

@@ -185,6 +185,9 @@ fn vcpu_reg_id(reg: VcpuRegister) -> u64 {
         VcpuRegister::Config(r) => id_from_reg(KVM_REG_RISCV_CONFIG, r as u64),
         VcpuRegister::Core(r) => id_from_reg(KVM_REG_RISCV_CORE, r as u64),
         VcpuRegister::Timer(r) => id_from_reg(KVM_REG_RISCV_TIMER, r as u64),
+        VcpuRegister::IsaExt(id) => {
+            id_from_reg(KVM_REG_RISCV_ISA_EXT | KVM_REG_RISCV_ISA_SINGLE, id)
+        }
     }
 }
 

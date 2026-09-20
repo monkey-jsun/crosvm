@@ -42,6 +42,8 @@ fn create_cpu_nodes(
     num_vcpus: u32,
     timebase_frequency: u32,
     isa_string: &str,
+    isa_extensions: &[&str],
+    cbo_block_sizes: [u32; 3],
     mmu_type: &str,
 ) -> Result<()> {
     let cpus_node = fdt.root_mut().subnode_mut("cpus")?;
@@ -55,7 +57,24 @@ fn create_cpu_nodes(
         cpu_node.set_prop("device_type", "cpu")?;
         cpu_node.set_prop("compatible", "riscv")?;
         cpu_node.set_prop("mmu-type", mmu_type)?;
+        // Legacy single-string form, kept for older parsers.
         cpu_node.set_prop("riscv,isa", isa_string)?;
+        // Modern list form (Linux >= 6.6): no canonical-ordering rules, unknown names are
+        // ignored.  Both forms describe the same set.
+        cpu_node.set_prop("riscv,isa-base", "rv64i")?;
+        cpu_node.set_prop("riscv,isa-extensions", isa_extensions)?;
+        // Cache-block operations are disabled by the guest kernel unless the block size is
+        // present, so these are emitted whenever the matching extension is advertised.
+        let [cbom, cboz, cbop] = cbo_block_sizes;
+        if cbom != 0 {
+            cpu_node.set_prop("riscv,cbom-block-size", cbom)?;
+        }
+        if cboz != 0 {
+            cpu_node.set_prop("riscv,cboz-block-size", cboz)?;
+        }
+        if cbop != 0 {
+            cpu_node.set_prop("riscv,cbop-block-size", cbop)?;
+        }
         cpu_node.set_prop("status", "okay")?;
         cpu_node.set_prop("reg", vcpu_id)?;
         cpu_node.set_prop("phandle", PHANDLE_CPU0 + vcpu_id)?;
@@ -310,6 +329,8 @@ pub fn create_fdt(
     initrd: Option<(GuestAddress, u32)>,
     timebase_frequency: u32,
     isa_string: &str,
+    isa_extensions: &[&str],
+    cbo_block_sizes: [u32; 3],
     mmu_type: &str,
     android_fstab: Option<File>,
     serial_devices: &[SerialDeviceInfo],
@@ -331,7 +352,15 @@ pub fn create_fdt(
         .map(|first_serial| format!("/U6_16550A@{:x}", first_serial.address));
     create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref())?;
     create_memory_node(&mut fdt, guest_mem)?;
-    create_cpu_nodes(&mut fdt, num_vcpus, timebase_frequency, isa_string, mmu_type)?;
+    create_cpu_nodes(
+        &mut fdt,
+        num_vcpus,
+        timebase_frequency,
+        isa_string,
+        isa_extensions,
+        cbo_block_sizes,
+        mmu_type,
+    )?;
     create_aia_node(&mut fdt, num_vcpus as usize, aia_num_ids, aia_num_sources)?;
     create_serial_nodes(&mut fdt, serial_devices)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges)?;

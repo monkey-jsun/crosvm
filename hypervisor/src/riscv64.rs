@@ -83,8 +83,15 @@ impl CpuConfigRiscv64 {
 #[repr(u64)]
 #[derive(Copy, Clone)]
 pub enum ConfigRegister {
+    /// `misa`: single-letter extensions as a bitmask.
     Isa = 0,
+    /// Zicbom cache-block size in bytes (0 if Zicbom unavailable).
+    ZicbomBlockSize = 1,
+    /// Zicboz cache-block size in bytes.
+    ZicbozBlockSize = 5,
     SatpMode = 6,
+    /// Zicbop cache-block size in bytes.
+    ZicbopBlockSize = 7,
 }
 
 /// Timer registers exposed by kvm.
@@ -139,6 +146,9 @@ pub enum VcpuRegister {
     Config(ConfigRegister),
     Core(CoreRegister),
     Timer(TimerRegister),
+    /// A single multi-letter ISA extension, by its `KVM_RISCV_ISA_EXT_*` id.  Reads as
+    /// 1 when enabled on the vCPU, 0 when disabled; fails if KVM has no such id.
+    IsaExt(u64),
 }
 
 // Convenience constructors for IrqRoutes
